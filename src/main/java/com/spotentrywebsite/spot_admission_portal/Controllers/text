@@ -1,0 +1,2 @@
+    private final String RAZORPAY_KEY_ID = "rzp_test_T2ftaxmkAgs6xn";
+    private final String RAZORPAY_SECRET_KEY = "P7GvzWaEgyMXS4vtHniSBm7G";
