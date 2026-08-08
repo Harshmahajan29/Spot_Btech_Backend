@@ -45,9 +45,28 @@ public class CetStudent {
     @Column(name = "cet_math_percentile")
     private Double mathsPercentile;
 
-    // HSC (Class 12) board marks
+    // HSC (Class 12) board marks — NOTE despite the field name, this is the
+    // HSC **PCM-group** percentage (Physics+Chemistry+Maths), not the overall
+    // Class XII percentage. See getHscPercentageOverall() below for that.
+    // (item 5) UserController.fetchAndVerify() previously read this field for
+    // BOTH "hsc" and "hscPcmPercent" in its response, which made the frontend's
+    // "HSC Overall %" and "HSC PCM %" fields always show identical numbers.
     @Column(name = "hsc_pcm_pct")
     private Double hscPercentage;
+
+    // This is the actual Class XII (HSC) OVERALL board percentage, despite the
+    // column name diploma_dvoc_pct and the getter name below — use this one for
+    // "overall" display fields, and hscPercentage above for the PCM-only figure.
+    public Double getHscPercentageOverall() {
+        return hscPercentageOverall;
+    }
+
+    public void setHscPercentageOverall(Double hscPercentageOverall) {
+        this.hscPercentageOverall = hscPercentageOverall;
+    }
+
+    @Column(name = "diploma_dvoc_pct")
+    private Double hscPercentageOverall;
 
     @Column(name = "merit_exam")
     private String examType;
@@ -104,7 +123,7 @@ public class CetStudent {
 //    public void setTfws(String tfws) { this.tfws = tfws; }
 
     public void setExamType(String examType){this.examType = examType;}
-public String getExamType(){return examType;}
+    public String getExamType(){return examType;}
     public Double getPercentileOverall() { return percentileOverall; }
     public void setPercentileOverall(Double percentileOverall) { this.percentileOverall = percentileOverall; }
 
@@ -117,6 +136,10 @@ public String getExamType(){return examType;}
     public Double getMathsPercentile() { return mathsPercentile; }
     public void setMathsPercentile(Double mathsPercentile) { this.mathsPercentile = mathsPercentile; }
 
+    // NOTE: this returns the HSC PCM-group percentage, not the overall
+    // percentage — see the comment on the field above. Kept as-is (not
+    // renamed to getHscPcmPercentage) to avoid a wider breaking change beyond
+    // the scope of the item-5 fix.
     public Double getHscPercentage() { return hscPercentage; }
     public void setHscPercentage(Double hscPercentage) { this.hscPercentage = hscPercentage; }
 

@@ -11,12 +11,12 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-import org.springframework.web.multipart.MultipartFile;
 
 import javax.sql.DataSource;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.Types;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -78,7 +78,7 @@ public class UserController {
     }
 
     // =========================================================================
-    // 1. PRE-PAYMENT REGISTRATION CHECK
+    // 1. PRE-REGISTRATION CHECK
     // =========================================================================
     @GetMapping("/user/check-registration/{appId}")
     public ResponseEntity<Boolean> checkRegistrationExists(@PathVariable String appId) {
@@ -102,7 +102,8 @@ public class UserController {
     }
 
     // =========================================================================
-    // 1b. RICH REGISTRATION-STATUS CHECK
+    // 1b. RICH REGISTRATION-STATUS CHECK (item 6 — used by the frontend both
+    //    right after profile fetch and again right before final submit)
     // =========================================================================
     @GetMapping("/user/registration-status/{appId}")
     public ResponseEntity<Map<String, Object>> getRegistrationStatus(@PathVariable String appId) {
@@ -111,11 +112,11 @@ public class UserController {
 
         String candidateQuery =
                 "SELECT full_name, category, email, phone_no, " +
-                        "hsc_percentage, physics_board_percent, chemistry_board_percent, maths_board_percent " +
+                        "hsc_percentage, physics_board_percent, chemistry_board_percent, maths_board_percent, defence_priority " +
                         "FROM spot_registrations WHERE application_id = ? " +
                         "UNION ALL " +
                         "SELECT candidate_name, 'JEE' as category, email, phone_no, " +
-                        "hsc_pcm_percent as hsc_percentage, NULL as physics_board_percent, NULL as chemistry_board_percent, NULL as maths_board_percent " +
+                        "hsc_pcm_percent as hsc_percentage, NULL as physics_board_percent, NULL as chemistry_board_percent, NULL as maths_board_percent, NULL as defence_priority " +
                         "FROM all_india WHERE application_id = ? " +
                         "LIMIT 1";
 
@@ -144,33 +145,13 @@ public class UserController {
                         candidate.put("hscPhysicsPercent", rs.getObject(6));
                         candidate.put("hscChemistryPercent", rs.getObject(7));
                         candidate.put("hscMathPercent", rs.getObject(8));
+                        candidate.put("defencePriority", rs.getObject(9));
                     }
                 }
             }
 
             result.put("registered", candidate != null);
             result.put("candidate", candidate);
-
-            if (candidate != null) {
-                String paymentQuery = "SELECT payment_transaction_id, razorpay_order_id, amount, currency, " +
-                        "payment_status, created_at FROM payment_records WHERE application_id = ? " +
-                        "ORDER BY created_at DESC LIMIT 1";
-                try (PreparedStatement ps = conn.prepareStatement(paymentQuery)) {
-                    ps.setString(1, targetId);
-                    try (ResultSet rs = ps.executeQuery()) {
-                        if (rs.next()) {
-                            Map<String, Object> payment = new LinkedHashMap<>();
-                            payment.put("paymentTransactionId", rs.getString(1));
-                            payment.put("razorpayOrderId", rs.getString(2));
-                            payment.put("amount", rs.getBigDecimal(3));
-                            payment.put("currency", rs.getString(4));
-                            payment.put("paymentStatus", rs.getString(5));
-                            payment.put("createdAt", rs.getTimestamp(6));
-                            result.put("payment", payment);
-                        }
-                    }
-                }
-            }
 
             return ResponseEntity.ok(result);
         } catch (Exception e) {
@@ -245,7 +226,15 @@ public class UserController {
             result.put("cetPhysics", c.getPhysicsPercentile());
             result.put("cetChemistry", c.getChemistryPercentile());
 
-            result.put("hsc", c.getHscPercentage());
+            // ---------------------------------------------------------------
+            // item 5 FIX: "hsc" and "hscPcmPercent" were both being set from
+            // c.getHscPercentage() (column hsc_pcm_pct — the PCM-group percentage),
+            // so the frontend's "HSC Overall %" and "HSC PCM %" fields always
+            // showed the identical number. c.getHscPercentageOverall() (column
+            // diploma_dvoc_pct) is the actual Class XII overall board percentage
+            // and belongs in "hsc" instead.
+            // ---------------------------------------------------------------
+            result.put("hsc", c.getHscPercentageOverall());
             result.put("hscPcmPercent", c.getHscPercentage());
             result.put("hscPhysics", c.getPhysicsBoardPercent());
             result.put("hscMaths", c.getMathsBoardPercent());
@@ -264,7 +253,10 @@ public class UserController {
             result.put("jeeChemistry", j.getJeeChemistryScore());
 
             if (!foundCet) {
-                result.put("hsc", j.getHscPcmPercent());
+                // Same fix as above, mirrored for the JEE-only path: "hsc" now
+                // comes from the overall board-percentage column instead of
+                // duplicating the PCM-only percentile.
+                result.put("hsc", j.getHscDiplomaDVocTotalPercent());
                 result.put("hscPcmPercent", j.getHscPcmPercent());
                 result.put("hscPhysics", j.getHscPhysicsPercent());
                 result.put("hscMaths", j.getHscMathPercent());
@@ -280,14 +272,25 @@ public class UserController {
     }
 
     // =========================================================================
-    // 2. REGISTRATION ROUTE — MULTIPART ONLY
+    // 2. REGISTRATION ROUTE — MULTIPART, JSON-ONLY PAYLOAD (payment gateway
+    //    removed — this endpoint persists the candidate directly; nothing here
+    //    writes to payment_records). Document files are no longer sent to this
+    //    endpoint at all: the frontend uploads them directly to Supabase Storage
+    //    and sends only the resulting public URLs inside studentDataJson
+    //    (marksheetDocUrl / casteValidityDocUrl / nclDocUrl / defenceCertDocUrl).
+    //    The request stays multipart/form-data purely because studentDataJson
+    //    and appId are still sent as form fields.
+    //
+    //    REQUIRED DB MIGRATION before deploying this change:
+    //      ALTER TABLE spot_registrations ADD COLUMN caste_validity_doc_url TEXT;
+    //      ALTER TABLE spot_registrations ADD COLUMN ncl_doc_url TEXT;
+    //      ALTER TABLE spot_registrations ADD COLUMN defence_cert_doc_url TEXT;
+    //      ALTER TABLE spot_registrations ADD COLUMN marksheet_doc_url TEXT;
     // =========================================================================
     @PostMapping(value = "/user/registration", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<?> registerStudent(
             @RequestParam(value = "appId", required = false) String formAppId,
-            @RequestParam(value = "studentDataJson", required = false) String studentDataJson,
-            @RequestParam(value = "casteValidityDoc", required = false) MultipartFile cvDoc,
-            @RequestParam(value = "nclDoc", required = false) MultipartFile nclDoc) {
+            @RequestParam(value = "studentDataJson", required = false) String studentDataJson) {
 
         String rawAppId = "";
         Map<String, Object> data = null;
@@ -334,6 +337,29 @@ public class UserController {
             return ResponseEntity.badRequest().body(Map.of("status", "ERROR", "message", "Application Identification String missing."));
         }
 
+        // item 6: belt-and-braces server-side duplicate guard, in addition to the
+        // frontend's pre-flight checks against /user/check-registration and
+        // /user/registration-status (which run right after profile fetch and
+        // again right before this call).
+        String dupCheckSql = "SELECT COUNT(*) FROM spot_registrations WHERE application_id = ? " +
+                "UNION ALL SELECT COUNT(*) FROM all_india WHERE application_id = ?";
+        try (Connection dupConn = dataSource.getConnection();
+             PreparedStatement dupPs = dupConn.prepareStatement(dupCheckSql)) {
+            dupPs.setString(1, sanitizedAppId);
+            dupPs.setString(2, sanitizedAppId);
+            try (ResultSet rs = dupPs.executeQuery()) {
+                int total = 0;
+                while (rs.next()) total += rs.getInt(1);
+                if (total > 0) {
+                    return ResponseEntity.status(409).body(Map.of(
+                            "status", "ALREADY_REGISTERED",
+                            "message", "A candidate with Application ID " + sanitizedAppId + " is already registered."));
+                }
+            }
+        } catch (Exception dupEx) {
+            System.err.println("Duplicate-check lookup notice: " + dupEx.getMessage());
+        }
+
         // Fallback verification against merit_list_2026 for Defence (pwd_def) & Category
         String meritQuery = "SELECT candidate_name, category, pwd_def FROM merit_list_2026 WHERE TRIM(application_id) = ?";
         try (Connection conn = dataSource.getConnection();
@@ -371,6 +397,17 @@ public class UserController {
             pwd = "DEF";
         }
 
+        // Defence Priority Quota: rank 1 (Priority I) through 9 (Priority IX), sent by
+        // the frontend only when pwd === "DEF". Required so the admin dashboard can sort
+        // defence-quota candidates by priority ahead of / within their category, per the
+        // CET Cell circular (Priority I = battle-casualty widows/wards, down to Priority IX).
+        Integer defencePriority = parseInteger(data, "defencePriority", "priority", "defencePriorityRank");
+        if (!"DEF".equals(pwd)) {
+            // Only meaningful for Defence-quota candidates — don't persist a stray value
+            // if pwd somehow isn't DEF despite a priority being present in the payload.
+            defencePriority = null;
+        }
+
         String examType = data.get("examType") != null ? data.get("examType").toString() :
                 (data.get("exam_type") != null ? data.get("exam_type").toString() : "CET");
 
@@ -390,6 +427,13 @@ public class UserController {
         Double hscPct = parseDouble(data, "hscPercentage", "hscPct", "hsc_percentage", "hscDiplomaVocTotalPercent", "hsc");
 
         Double hscPhysics = parseDouble(data, "hscPhysicsPercent", "hscPhysics", "physics_board_percent");
+        // NOTE: HSC Chemistry marks were removed from the frontend form. The frontend no
+        // longer sends "hscChemistryPercent" for manual/Non-CAP candidates, so this will
+        // resolve to 0.0 for those records going forward. The CAP automated-lookup flow
+        // (fetchAndVerify) never populated a board-level chemistry figure either, so this
+        // column has effectively been unused there too. The chemistry_board_percent
+        // column itself is left in place for historical rows already in the table —
+        // flagging in case you want to drop it in a future migration.
         Double hscChemistry = parseDouble(data, "hscChemistryPercent", "hscChemistry", "chemistry_board_percent");
         Double hscMath = parseDouble(data, "hscMathPercent", "hscMaths", "maths_board_percent");
 
@@ -398,29 +442,29 @@ public class UserController {
         Double jeePhys = parseDouble(data, "jeePhysicsPercentile", "jeePhysicsScore", "jeePhysics");
         Double jeeChem = parseDouble(data, "jeeChemistryPercentile", "jeeChemistryScore", "jeeChemistry");
 
-        String paymentTxnId = data.get("paymentId") != null ? data.get("paymentId").toString() : null;
-        String razorpayOrderId = data.get("razorpayOrderId") != null ? data.get("razorpayOrderId").toString() : null;
-        String paymentStatus = data.get("paymentStatus") != null ? data.get("paymentStatus").toString() : "SUCCESS";
-        java.math.BigDecimal paymentAmount = java.math.BigDecimal.ZERO;
-        try {
-            if (data.get("paymentAmount") != null) {
-                paymentAmount = new java.math.BigDecimal(data.get("paymentAmount").toString());
-            }
-        } catch (Exception ignored) { }
-        String paymentCurrency = data.get("paymentCurrency") != null ? data.get("paymentCurrency").toString() : "INR";
+        // item 2: document URLs — uploaded client-side directly to Supabase Storage.
+        // Any of these may be null (document not required / not uploaded).
+        String marksheetDocUrl = stringOrNull(data, "marksheetDocUrl");
+        String casteValidityDocUrl = stringOrNull(data, "casteValidityDocUrl");
+        String nclDocUrl = stringOrNull(data, "nclDocUrl");
+        String defenceCertDocUrl = stringOrNull(data, "defenceCertDocUrl");
 
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
 
             try {
                 if (foundCet) {
-                    // Spot registration insert: Stores main category in category, defence flag in pwd
+                    // Spot registration insert: Stores main category in category, defence flag in pwd,
+                    // the Defence priority rank (1-9) when pwd == "DEF", and now the Supabase document
+                    // URLs (see migration note above the method for the required ALTER TABLE statements).
                     String insertStateSql = "INSERT INTO spot_registrations (" +
                             "application_id, full_name, category, gender, pwd, exam_type, " +
                             "percentile_overall, maths_percentile, physics_percentile, chemistry_percentile, " +
                             "hsc_percentage, physics_board_percent, chemistry_board_percent, maths_board_percent, " +
+                            "defence_priority, " +
+                            "caste_validity_doc_url, ncl_doc_url, defence_cert_doc_url, marksheet_doc_url, " +
                             "email, phone_no) " +
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
                     try (PreparedStatement psState = conn.prepareStatement(insertStateSql)) {
                         psState.setString(1, sanitizedAppId);
@@ -437,8 +481,17 @@ public class UserController {
                         psState.setDouble(12, hscPhysics);
                         psState.setDouble(13, hscChemistry);
                         psState.setDouble(14, hscMath);
-                        psState.setString(15, email);
-                        psState.setString(16, phoneNo);
+                        if (defencePriority != null) {
+                            psState.setInt(15, defencePriority);
+                        } else {
+                            psState.setNull(15, Types.INTEGER);
+                        }
+                        psState.setString(16, casteValidityDocUrl);
+                        psState.setString(17, nclDocUrl);
+                        psState.setString(18, defenceCertDocUrl);
+                        psState.setString(19, marksheetDocUrl);
+                        psState.setString(20, email);
+                        psState.setString(21, phoneNo);
                         psState.executeUpdate();
                     }
                 }
@@ -462,28 +515,6 @@ public class UserController {
                     }
                 }
 
-                if (paymentTxnId != null && !paymentTxnId.isBlank()) {
-                    String insertPaymentSql = "INSERT INTO payment_records " +
-                            "(candidate_name, application_id, mobile_no, email, payment_transaction_id, " +
-                            "razorpay_order_id, amount, currency, payment_status) " +
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) " +
-                            "ON CONFLICT (payment_transaction_id) DO NOTHING";
-                    try (PreparedStatement psPay = conn.prepareStatement(insertPaymentSql)) {
-                        psPay.setString(1, fullName);
-                        psPay.setString(2, sanitizedAppId);
-                        psPay.setString(3, phoneNo);
-                        psPay.setString(4, email);
-                        psPay.setString(5, paymentTxnId);
-                        psPay.setString(6, razorpayOrderId);
-                        psPay.setBigDecimal(7, paymentAmount);
-                        psPay.setString(8, paymentCurrency);
-                        psPay.setString(9, paymentStatus);
-                        psPay.executeUpdate();
-                    } catch (Exception payEx) {
-                        System.err.println("Payment record insert failed for " + sanitizedAppId + ": " + payEx.getMessage());
-                    }
-                }
-
                 conn.commit();
 
                 if (isOms && foundCet) {
@@ -504,6 +535,9 @@ public class UserController {
                         oms.setJeeChemistryScore(jeeChem);
                         oms.setEmail(email);
                         oms.setPhoneNo(phoneNo);
+                        // TODO: OutsideMaharashtraCandidate entity needs a defencePriority
+                        // field + setter added before this line can be uncommented:
+                        // oms.setDefencePriority(defencePriority);
 
                         if (!omsRepo.existsById(sanitizedAppId)) {
                             omsRepo.save(oms);
@@ -536,69 +570,24 @@ public class UserController {
         return 0.0;
     }
 
-    // =========================================================================
-    // 3. PAYMENT RECORDS
-    // =========================================================================
-    @GetMapping("/api/admin/payment-records")
-    public ResponseEntity<java.util.List<Map<String, Object>>> getAllPaymentRecords(
-            @RequestParam(value = "search", required = false) String search) {
-
-        java.util.List<Map<String, Object>> records = new java.util.ArrayList<>();
-        String sql = "SELECT id, candidate_name, application_id, mobile_no, email, payment_transaction_id, " +
-                "razorpay_order_id, amount, currency, payment_status, created_at FROM payment_records " +
-                (search != null && !search.isBlank()
-                        ? "WHERE application_id ILIKE ? OR candidate_name ILIKE ? OR payment_transaction_id ILIKE ? "
-                        : "") +
-                "ORDER BY created_at DESC";
-
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
-
-            if (search != null && !search.isBlank()) {
-                String like = "%" + search.trim() + "%";
-                ps.setString(1, like);
-                ps.setString(2, like);
-                ps.setString(3, like);
+    // New: mirrors parseDouble but returns null (not 0) when absent/unparseable, since
+    // 0 is not a safe default for defencePriority — it would collide with "no priority
+    // set" and rank as if it were higher than Priority I in a naive comparator.
+    private Integer parseInteger(Map<String, Object> map, String... keys) {
+        for (String key : keys) {
+            if (map.containsKey(key) && map.get(key) != null) {
+                try {
+                    return Integer.parseInt(map.get(key).toString());
+                } catch (NumberFormatException ignored) {}
             }
-
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    Map<String, Object> row = new LinkedHashMap<>();
-                    row.put("id", rs.getLong("id"));
-                    row.put("candidateName", rs.getString("candidate_name"));
-                    row.put("applicationId", rs.getString("application_id"));
-                    row.put("mobileNo", rs.getString("mobile_no"));
-                    row.put("email", rs.getString("email"));
-                    row.put("paymentTransactionId", rs.getString("payment_transaction_id"));
-                    row.put("razorpayOrderId", rs.getString("razorpay_order_id"));
-                    row.put("amount", rs.getBigDecimal("amount"));
-                    row.put("currency", rs.getString("currency"));
-                    row.put("paymentStatus", rs.getString("payment_status"));
-                    row.put("createdAt", rs.getTimestamp("created_at"));
-                    records.add(row);
-                }
-            }
-            return ResponseEntity.ok(records);
-        } catch (Exception e) {
-            return ResponseEntity.internalServerError().body(java.util.List.of());
         }
+        return null;
     }
 
-    @GetMapping("/api/admin/payment-records/summary")
-    public ResponseEntity<Map<String, Object>> getPaymentSummary() {
-        Map<String, Object> summary = new LinkedHashMap<>();
-        String sql = "SELECT COUNT(*) AS total_count, COALESCE(SUM(amount), 0) AS total_amount " +
-                "FROM payment_records WHERE payment_status = 'SUCCESS'";
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql);
-             ResultSet rs = ps.executeQuery()) {
-            if (rs.next()) {
-                summary.put("totalSuccessfulPayments", rs.getInt("total_count"));
-                summary.put("totalAmountCollected", rs.getBigDecimal("total_amount"));
-            }
-            return ResponseEntity.ok(summary);
-        } catch (Exception e) {
-            return ResponseEntity.internalServerError().body(Map.of("error", e.getMessage()));
-        }
+    // item 2: pulls a Supabase public document URL out of the payload, or null
+    // if that document wasn't uploaded (all document fields are optional here).
+    private String stringOrNull(Map<String, Object> map, String key) {
+        Object val = map.get(key);
+        return val != null ? val.toString() : null;
     }
 }

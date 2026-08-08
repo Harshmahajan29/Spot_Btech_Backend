@@ -4,7 +4,7 @@ import jakarta.persistence.*;
 
 @Entity
 @Table(
-        name = "all_india_diploma",
+        name = "diploma_students",
         indexes = { @Index(name = "idx_diploma_lookup", columnList = "candidate_id") }
 )
 public class SaveDiploma {
@@ -27,9 +27,6 @@ public class SaveDiploma {
 
     @Column(name = "final_eligible_category", nullable = false, length = 20)
     private String finalEligibleCategory;
-
-    @Column(name = "system_flag", length = 5)
-    private String systemFlag;
 
     @Column(name = "diploma_percentage", nullable = false)
     private Double diplomaPercentage;
@@ -65,8 +62,6 @@ public class SaveDiploma {
     public String getFinalEligibleCategory() { return finalEligibleCategory; }
     public void setFinalEligibleCategory(String finalEligibleCategory) { this.finalEligibleCategory = finalEligibleCategory; }
 
-    public String getSystemFlag() { return systemFlag; }
-    public void setSystemFlag(String systemFlag) { this.systemFlag = systemFlag; }
 
     public Double getDiplomaPercentage() { return diplomaPercentage; }
     public void setDiplomaPercentage(Double diplomaPercentage) { this.diplomaPercentage = diplomaPercentage; }
