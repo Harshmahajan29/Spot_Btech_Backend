@@ -4,7 +4,7 @@ import jakarta.persistence.*;
 
 @Entity
 @Table(
-        name = "all_india_merit_list_2026",
+        name = "all_india_merit_list_2026_full",
         indexes = { @Index(name = "idx_jee_app_id", columnList = "applicationId") }
 )
 public class JeeStudent {
