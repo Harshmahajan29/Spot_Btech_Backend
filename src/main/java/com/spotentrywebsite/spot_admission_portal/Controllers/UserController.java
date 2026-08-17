@@ -42,6 +42,16 @@ public class UserController {
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     // =========================================================================
+    // HELPER: VALIDATE JEE SUBJECT PERCENTILES ARE NOT NULL
+    // =========================================================================
+    private boolean hasValidJeeScores(JeeStudent jeeStudent) {
+        if (jeeStudent == null) return false;
+        return jeeStudent.getJeeMathScore() != null &&
+                jeeStudent.getJeePhysicsScore() != null &&
+                jeeStudent.getJeeChemistryScore() != null;
+    }
+
+    // =========================================================================
     // HELPER: SANITIZE NAME AND CATEGORY (PRESERVES NT-A/B/C/D & DEFENCE)
     // =========================================================================
     private Map<String, String> sanitizeNameAndCategory(String rawName, String rawCategory) {
@@ -102,59 +112,42 @@ public class UserController {
     }
 
     // =========================================================================
-    // 1b. RICH REGISTRATION-STATUS CHECK (item 6 — used by the frontend both
-    //    right after profile fetch and again right before final submit)
+    // 1b. RICH REGISTRATION-STATUS CHECK
     // =========================================================================
     @GetMapping("/user/registration-status/{appId}")
     public ResponseEntity<Map<String, Object>> getRegistrationStatus(@PathVariable String appId) {
         String targetId = appId.trim().toUpperCase();
         Map<String, Object> result = new LinkedHashMap<>();
 
-        String candidateQuery =
-                "SELECT full_name, category, email, phone_no, " +
-                        "hsc_percentage, physics_board_percent, chemistry_board_percent, maths_board_percent, defence_priority " +
-                        "FROM spot_registrations WHERE application_id = ? " +
-                        "UNION ALL " +
-                        "SELECT candidate_name, 'JEE' as category, email, phone_no, " +
-                        "hsc_pcm_percent as hsc_percentage, NULL as physics_board_percent, NULL as chemistry_board_percent, NULL as maths_board_percent, NULL as defence_priority " +
-                        "FROM all_india WHERE application_id = ? " +
-                        "LIMIT 1";
+        System.out.println("[registration-status] Checking existence for applicationId = '" + targetId + "'");
 
-        try (Connection conn = dataSource.getConnection()) {
-            Map<String, Object> candidate = null;
-            try (PreparedStatement ps = conn.prepareStatement(candidateQuery)) {
-                ps.setString(1, targetId);
-                ps.setString(2, targetId);
-                try (ResultSet rs = ps.executeQuery()) {
-                    if (rs.next()) {
-                        candidate = new LinkedHashMap<>();
-                        candidate.put("applicationId", targetId);
-                        candidate.put("fullName", rs.getString(1));
-                        candidate.put("category", rs.getString(2));
-                        candidate.put("email", rs.getString(3));
-                        candidate.put("phoneNo", rs.getString(4));
+        String checkExistsQuery =
+                "SELECT EXISTS (" +
+                        "    SELECT 1 FROM spot_registrations WHERE application_id = ? " +
+                        "    UNION ALL " +
+                        "    SELECT 1 FROM all_india WHERE application_id = ?" +
+                        ")";
 
-                        Map<String, Object> hscDetails = new LinkedHashMap<>();
-                        hscDetails.put("hscPercentage", rs.getObject(5));
-                        hscDetails.put("hscPhysicsPercent", rs.getObject(6));
-                        hscDetails.put("hscChemistryPercent", rs.getObject(7));
-                        hscDetails.put("hscMathPercent", rs.getObject(8));
-                        candidate.put("hscDetails", hscDetails);
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(checkExistsQuery)) {
 
-                        candidate.put("hscPercentage", rs.getObject(5));
-                        candidate.put("hscPhysicsPercent", rs.getObject(6));
-                        candidate.put("hscChemistryPercent", rs.getObject(7));
-                        candidate.put("hscMathPercent", rs.getObject(8));
-                        candidate.put("defencePriority", rs.getObject(9));
-                    }
+            ps.setString(1, targetId);
+            ps.setString(2, targetId);
+
+            boolean exists = false;
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    exists = rs.getBoolean(1);
                 }
             }
 
-            result.put("registered", candidate != null);
-            result.put("candidate", candidate);
-
+            result.put("registered", exists);
+            result.put("applicationId", targetId);
             return ResponseEntity.ok(result);
+
         } catch (Exception e) {
+            System.err.println("[registration-status] EXCEPTION for '" + targetId + "': " + e);
+            e.printStackTrace();
             result.put("registered", false);
             result.put("error", e.getMessage());
             return ResponseEntity.ok(result);
@@ -171,13 +164,15 @@ public class UserController {
         Optional<CetStudent> cetOpt = cetStudentRepository.findById(targetId);
         Optional<JeeStudent> jeeOpt = jeeStudentRepository.findByApplicationId(targetId);
 
-        if (cetOpt.isEmpty() && jeeOpt.isEmpty()) {
+        boolean foundCet = cetOpt.isPresent();
+        // Updated Logic: Verify JeeStudent is present AND subject percentiles are not null
+        boolean foundJee = jeeOpt.isPresent() && hasValidJeeScores(jeeOpt.get());
+
+        if (!foundCet && !foundJee) {
             return ResponseEntity.notFound().build();
         }
 
         Map<String, Object> result = new LinkedHashMap<>();
-        boolean foundCet = cetOpt.isPresent();
-        boolean foundJee = jeeOpt.isPresent();
 
         result.put("applicationId", targetId);
         result.put("foundCet", foundCet);
@@ -226,14 +221,6 @@ public class UserController {
             result.put("cetPhysics", c.getPhysicsPercentile());
             result.put("cetChemistry", c.getChemistryPercentile());
 
-            // ---------------------------------------------------------------
-            // item 5 FIX: "hsc" and "hscPcmPercent" were both being set from
-            // c.getHscPercentage() (column hsc_pcm_pct — the PCM-group percentage),
-            // so the frontend's "HSC Overall %" and "HSC PCM %" fields always
-            // showed the identical number. c.getHscPercentageOverall() (column
-            // diploma_dvoc_pct) is the actual Class XII overall board percentage
-            // and belongs in "hsc" instead.
-            // ---------------------------------------------------------------
             result.put("hsc", c.getHscPercentageOverall());
             result.put("hscPcmPercent", c.getHscPercentage());
             result.put("hscPhysics", c.getPhysicsBoardPercent());
@@ -253,9 +240,6 @@ public class UserController {
             result.put("jeeChemistry", j.getJeeChemistryScore());
 
             if (!foundCet) {
-                // Same fix as above, mirrored for the JEE-only path: "hsc" now
-                // comes from the overall board-percentage column instead of
-                // duplicating the PCM-only percentile.
                 result.put("hsc", j.getHscDiplomaDVocTotalPercent());
                 result.put("hscPcmPercent", j.getHscPcmPercent());
                 result.put("hscPhysics", j.getHscPhysicsPercent());
@@ -272,20 +256,7 @@ public class UserController {
     }
 
     // =========================================================================
-    // 2. REGISTRATION ROUTE — MULTIPART, JSON-ONLY PAYLOAD (payment gateway
-    //    removed — this endpoint persists the candidate directly; nothing here
-    //    writes to payment_records). Document files are no longer sent to this
-    //    endpoint at all: the frontend uploads them directly to Supabase Storage
-    //    and sends only the resulting public URLs inside studentDataJson
-    //    (marksheetDocUrl / casteValidityDocUrl / nclDocUrl / defenceCertDocUrl).
-    //    The request stays multipart/form-data purely because studentDataJson
-    //    and appId are still sent as form fields.
-    //
-    //    REQUIRED DB MIGRATION before deploying this change:
-    //      ALTER TABLE spot_registrations ADD COLUMN caste_validity_doc_url TEXT;
-    //      ALTER TABLE spot_registrations ADD COLUMN ncl_doc_url TEXT;
-    //      ALTER TABLE spot_registrations ADD COLUMN defence_cert_doc_url TEXT;
-    //      ALTER TABLE spot_registrations ADD COLUMN marksheet_doc_url TEXT;
+    // 2. REGISTRATION ROUTE — MULTIPART, JSON-ONLY PAYLOAD
     // =========================================================================
     @PostMapping(value = "/user/registration", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<?> registerStudent(
@@ -337,10 +308,7 @@ public class UserController {
             return ResponseEntity.badRequest().body(Map.of("status", "ERROR", "message", "Application Identification String missing."));
         }
 
-        // item 6: belt-and-braces server-side duplicate guard, in addition to the
-        // frontend's pre-flight checks against /user/check-registration and
-        // /user/registration-status (which run right after profile fetch and
-        // again right before this call).
+        // Server-side duplicate guard
         String dupCheckSql = "SELECT COUNT(*) FROM spot_registrations WHERE application_id = ? " +
                 "UNION ALL SELECT COUNT(*) FROM all_india WHERE application_id = ?";
         try (Connection dupConn = dataSource.getConnection();
@@ -379,7 +347,6 @@ public class UserController {
                         rawFullName = mName;
                     }
 
-                    // Check if candidate is marked DEFENCE in pwd_def column
                     if (pwdDef != null && (pwdDef.toUpperCase().contains("DEF") || pwdDef.toUpperCase().contains("DEFENCE"))) {
                         pwd = "DEF";
                     }
@@ -387,24 +354,17 @@ public class UserController {
             }
         } catch (Exception ignored) { }
 
-        // Sanitize name and extract precise Category (e.g. NT-D, OBC, SC)
+        // Sanitize name and extract precise Category
         Map<String, String> sanitized = sanitizeNameAndCategory(rawFullName, rawCategory);
         String fullName = sanitized.get("name");
         String category = sanitized.get("category");
 
-        // Set pwd to DEF if Defence payload parameter received
         if (pwd != null && (pwd.trim().equalsIgnoreCase("DEF") || pwd.trim().equalsIgnoreCase("DEFENCE"))) {
             pwd = "DEF";
         }
 
-        // Defence Priority Quota: rank 1 (Priority I) through 9 (Priority IX), sent by
-        // the frontend only when pwd === "DEF". Required so the admin dashboard can sort
-        // defence-quota candidates by priority ahead of / within their category, per the
-        // CET Cell circular (Priority I = battle-casualty widows/wards, down to Priority IX).
         Integer defencePriority = parseInteger(data, "defencePriority", "priority", "defencePriorityRank");
         if (!"DEF".equals(pwd)) {
-            // Only meaningful for Defence-quota candidates — don't persist a stray value
-            // if pwd somehow isn't DEF despite a priority being present in the payload.
             defencePriority = null;
         }
 
@@ -413,6 +373,14 @@ public class UserController {
 
         boolean foundCet = data.get("foundCet") != null && Boolean.parseBoolean(data.get("foundCet").toString());
         boolean foundJee = data.get("foundJee") != null && Boolean.parseBoolean(data.get("foundJee").toString());
+
+        // Double check repository directly to verify subject scores are non-null
+        if (foundJee) {
+            Optional<JeeStudent> dbJeeOpt = jeeStudentRepository.findByApplicationId(sanitizedAppId);
+            if (dbJeeOpt.isEmpty() || !hasValidJeeScores(dbJeeOpt.get())) {
+                foundJee = false;
+            }
+        }
 
         if (!foundCet && !foundJee) {
             foundCet = true;
@@ -427,13 +395,6 @@ public class UserController {
         Double hscPct = parseDouble(data, "hscPercentage", "hscPct", "hsc_percentage", "hscDiplomaVocTotalPercent", "hsc");
 
         Double hscPhysics = parseDouble(data, "hscPhysicsPercent", "hscPhysics", "physics_board_percent");
-        // NOTE: HSC Chemistry marks were removed from the frontend form. The frontend no
-        // longer sends "hscChemistryPercent" for manual/Non-CAP candidates, so this will
-        // resolve to 0.0 for those records going forward. The CAP automated-lookup flow
-        // (fetchAndVerify) never populated a board-level chemistry figure either, so this
-        // column has effectively been unused there too. The chemistry_board_percent
-        // column itself is left in place for historical rows already in the table —
-        // flagging in case you want to drop it in a future migration.
         Double hscChemistry = parseDouble(data, "hscChemistryPercent", "hscChemistry", "chemistry_board_percent");
         Double hscMath = parseDouble(data, "hscMathPercent", "hscMaths", "maths_board_percent");
 
@@ -442,8 +403,6 @@ public class UserController {
         Double jeePhys = parseDouble(data, "jeePhysicsPercentile", "jeePhysicsScore", "jeePhysics");
         Double jeeChem = parseDouble(data, "jeeChemistryPercentile", "jeeChemistryScore", "jeeChemistry");
 
-        // item 2: document URLs — uploaded client-side directly to Supabase Storage.
-        // Any of these may be null (document not required / not uploaded).
         String marksheetDocUrl = stringOrNull(data, "marksheetDocUrl");
         String casteValidityDocUrl = stringOrNull(data, "casteValidityDocUrl");
         String nclDocUrl = stringOrNull(data, "nclDocUrl");
@@ -454,9 +413,6 @@ public class UserController {
 
             try {
                 if (foundCet) {
-                    // Spot registration insert: Stores main category in category, defence flag in pwd,
-                    // the Defence priority rank (1-9) when pwd == "DEF", and now the Supabase document
-                    // URLs (see migration note above the method for the required ALTER TABLE statements).
                     String insertStateSql = "INSERT INTO spot_registrations (" +
                             "application_id, full_name, category, gender, pwd, exam_type, " +
                             "percentile_overall, maths_percentile, physics_percentile, chemistry_percentile, " +
@@ -496,6 +452,7 @@ public class UserController {
                     }
                 }
 
+                // Strictly executed only if foundJee is true AND subject scores were non-null
                 if (foundJee) {
                     String insertJeeSql = "INSERT INTO all_india (application_id, candidate_name, " +
                             "merit_exam_percentile_mark, jee_math_percentile, jee_physics_percentile, jee_chemistry_percentile, hsc_pcm_percent, email, phone_no) " +
@@ -535,9 +492,6 @@ public class UserController {
                         oms.setJeeChemistryScore(jeeChem);
                         oms.setEmail(email);
                         oms.setPhoneNo(phoneNo);
-                        // TODO: OutsideMaharashtraCandidate entity needs a defencePriority
-                        // field + setter added before this line can be uncommented:
-                        // oms.setDefencePriority(defencePriority);
 
                         if (!omsRepo.existsById(sanitizedAppId)) {
                             omsRepo.save(oms);
@@ -570,9 +524,6 @@ public class UserController {
         return 0.0;
     }
 
-    // New: mirrors parseDouble but returns null (not 0) when absent/unparseable, since
-    // 0 is not a safe default for defencePriority — it would collide with "no priority
-    // set" and rank as if it were higher than Priority I in a naive comparator.
     private Integer parseInteger(Map<String, Object> map, String... keys) {
         for (String key : keys) {
             if (map.containsKey(key) && map.get(key) != null) {
@@ -584,8 +535,6 @@ public class UserController {
         return null;
     }
 
-    // item 2: pulls a Supabase public document URL out of the payload, or null
-    // if that document wasn't uploaded (all document fields are optional here).
     private String stringOrNull(Map<String, Object> map, String key) {
         Object val = map.get(key);
         return val != null ? val.toString() : null;
